@@ -152,6 +152,15 @@ Note: only ~34 GB lands on the iGPU (29.6 GB weights + 3.9 GB KV + 1.3 GB comput
   --flash-attn on -b 2048 -ub 2048 --ctx-checkpoints 0
 ```
 
+### 3.3 Multi GPU: dGPU + dGPU
+```powershell
+$M = "C:\Users\gta\Documents\Models\mai-code\models"
+$B = "C:\Users\gta\Documents\project\llama"
+
+ & "$B\llama-server.exe" -m "$M\MAI-Code-1.1-Flash-Q2-XS.gguf" -md "$M\dflash-v3-lc1.gguf" -ngl 999 -fa on -np 1 --no-host --fit off -sm layer -c 131072 -ctk f16 -ctv f16 -b 2048 -ub 1024 `
+ --spec-type draft-dflash --spec-draft-ngl all --spec-draft-n-max 2 --spec-draft-p-min 0.2 --ctx-checkpoints 0
+```
+
 - llama.cpp skips the iGPU by default when a dGPU exists, so list both in `-dev`.
 - `-sm layer` splits by layer; `-ts 9,55` = ~9 GB on dGPU, rest on iGPU. Lower the first value if dGPU OOM.
 - iGPU is slow and uses shared RAM; it usually limits overall speed.
@@ -277,3 +286,108 @@ Use `-ctk q8_0 -ctv q8_0` to roughly halve it.
 - Reads target hidden states from layers 2, 11, 21, 31, 40.
 - Weights Q4_K (+4 Q6_K), F32 norms.
 - KV at 131072 ctx: 512 MiB (1 full layer) + 160 MiB (4 SWA layers, window 8192).
+
+## 5. Linux: 2x Intel Battlemage G31 (Vulkan)
+
+Machine: Linux, 2x Intel Battlemage G31 dGPU (`xe` kernel driver) + ASPEED BMC VGA.
+
+Quickly check if mesa driver is available 
+
+```bash
+apt-cache policy mesa-vulkan-drivers   # we got 26.2.5~kisak1~n
+```
+
+### 5.1 Build tools
+
+```bash
+sudo apt-get install -y glslc vulkan-tools ninja-build spirv-headers libcurl4-openssl-dev
+```
+
+`git`, `cmake` and a C++ compiler (GCC 13.3) were already installed on our machine. Install them if yours does not have them.
+
+### 5.2 LunarG Vulkan SDK (only for its shader compiler)
+
+Ubuntu 24.04's `glslc` cannot build the integer-dot shaders, which add 19–25% generation speed.
+
+```bash
+mkdir -p ~/mai-code/tools/vulkan-sdk && cd ~/mai-code/tools
+curl -sSfL https://sdk.lunarg.com/sdk/download/latest/linux/vulkan_sdk.tar.xz -o vulkan_sdk.tar.xz
+tar -xJf vulkan_sdk.tar.xz -C vulkan-sdk
+ls vulkan-sdk   # we got 1.4.363.0
+```
+
+### 5.3 Build
+
+```bash
+source /home/gta/mai-code/tools/vulkan-sdk/1.4.363.1/setup-env.sh
+cmake -B build-vk-sdk -DGGML_VULKAN=ON -DVulkan_GLSLC_EXECUTABLE=$VULKAN_SDK/bin/glslc
+cmake --build build-vk-sdk -j 16
+```
+
+### 5.4 Check GPU usage
+
+`sudo intel_gpu_top` fails with `no discrete/integrated i915 devices found`: Battlemage uses the `xe` driver, older `intel_gpu_top` supports only i915. `/sys/class/drm/card*/device/gpu_busy_percent` is also empty.
+
+Options:
+
+```bash
+lspci -k | grep -A3 -iE 'vga|display'      # confirm driver (xe)
+sudo apt install nvtop && nvtop            # nvtop >= 3.1 supports xe (or: sudo snap install nvtop)
+cargo install --locked qmassa && sudo ~/.cargo/bin/qmassa   # Intel xe monitor
+# no tools: per-process DRM stats (drm-cycles-* rise when GPU is busy)
+watch -n1 "sudo cat /proc/$(pgrep -f llama-server)/fdinfo/* 2>/dev/null | grep -E '^drm-(cycles|total-cycles|total|resident)'"
+```
+
+igt-gpu-tools >= 2.0 `intel_gpu_top` also supports xe.
+
+High CPU (~97%) on `llama-server` with `-ngl 999` is normal: the main thread spins while waiting for the GPU. Confirm offload in the log (`offloaded X/X layers to GPU`).
+
+### 5.5 Run commands
+
+Layer split (works, with DFlash draft):
+
+```bash
+$B/llama-server -m $M -ngl 999 -fa on -np 1 --no-host --fit off -sm layer -c 131072 -ctk f16 -ctv f16 -b 2048 -ub 1024 \
+  -md models/dflash-v3-lc1.gguf --spec-type draft-dflash --spec-draft-ngl all --spec-draft-n-max 2 --spec-draft-p-min 0.2 --ctx-checkpoints 0
+```
+
+Tensor parallel (`-sm tensor`) without draft model:
+
+```bash
+$B/llama-server -m $M -ngl 999 -fa on -np 1 --no-host --fit off -sm tensor -c 131072 -ctk f16 -ctv f16 -b 2048 -ub 1024 --ctx-checkpoints 0
+```
+
+`-sm` = `--split-mode`, values:
+
+| Value | Meaning |
+|---|---|
+| `none` | One GPU only |
+| `layer` (default) | Split layers and KV across GPUs (pipelined, GPUs take turns) |
+| `row` | Split weights by rows (parallel) |
+| `tensor` | Split weights and KV across GPUs (parallel, EXPERIMENTAL) |
+
+Optional: `-ts 1,1` for an even split; `GGML_VK_VISIBLE_DEVICES=0,1` to use only the two Vulkan GPUs. `-sm tensor` fails at load with `LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'` if the arch is not supported.
+
+### 5.6 Crash: `-sm tensor` + DFlash draft
+
+```
+init: DFlash target features via device buffer
+ggml/src/ggml-backend-meta.cpp:573: GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0) failed
+... ggml_backend_meta_get_split_state -> ggml_gallocr_alloc_graph -> llama_context::decode -> common_context_can_seq_rm -> server load_model
+```
+
+Meaning: in tensor mode a tensor is split along axis 0 (hidden dim) across GPUs. Per-row ops (norm, softmax, get_rows, ...) need full rows on each GPU, so the meta backend asserts. It fires on the first test decode, right after DFlash sets up reading target hidden states from device buffers. Likely cause: DFlash speculative decoding does not support `-sm tensor` yet (a llama.cpp bug, not a command-line error).
+
+Next steps:
+
+1. Run `-sm tensor` without the draft model (5.5). If it works, the problem is DFlash + tensor split. If it still crashes, the main model graph has an op that tensor mode does not support yet.
+2. For a symbolized backtrace: `cmake -B build-vk-dbg -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build-vk-dbg -j 16`.
+3. Workaround: `-sm layer` with DFlash, or `-sm tensor` without the draft model. Compare tokens/s.
+4. Search llama.cpp issues for "split-mode tensor" + dflash/speculative; report with the backtrace and a minimal command if none exists.
+
+## 6. Status: 2x dGPU results
+
+| `-sm` | Linux with draft | Linux without draft | Linux GPU usage | Windows with draft | Windows without draft |
+|---|---|---|---|---|---|
+| `layer` | 74 t/s | 70 t/s | 30% ; 52% | No result | |
+| `tensor` | failed (see 5.6) | 25 t/s | 54%; 54% | | |
