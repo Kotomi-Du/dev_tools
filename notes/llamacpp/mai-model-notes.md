@@ -1,97 +1,6 @@
-# llama.cpp + MAI-Code-1.1-Flash (Windows, Vulkan)
+# llama.cpp + MAI-Code-1.1-Flash (Vulkan)
 
-Machine: i9-13900K, 128 GB RAM, Vulkan0 = Intel dGPU (12 GB), Vulkan1 = Intel UHD 770 iGPU (shared RAM, ~64 GB).
-
-## 1. Build llama.cpp for Vulkan backend
-
-Vulkan SDK: `C:\VulkanSDK\1.4.363.1`
-
-### build with w64devkit (MinGW)
-
-w64devkit: `C:\w64devkit`. One-time Vulkan setup, run inside `C:\w64devkit\w64devkit.exe`:
-
-```sh
-SDK_VERSION=1.4.363.1
-VULKAN_SDK=C:/VulkanSDK/$SDK_VERSION
-W64DEVKIT_HOME=C:/w64devkit
-
-cp "$VULKAN_SDK/Bin/glslc.exe" "$W64DEVKIT_HOME/bin/"
-cp "$VULKAN_SDK/Lib/vulkan-1.lib" "$W64DEVKIT_HOME/lib/"
-cp -r "$VULKAN_SDK/Include/"* "$W64DEVKIT_HOME/include/"
-mkdir -p "$W64DEVKIT_HOME/lib/pkgconfig"
-cat > "$W64DEVKIT_HOME/lib/pkgconfig/vulkan.pc" <<EOF
-Name: Vulkan-Loader
-Description: Vulkan Loader
-Version: $SDK_VERSION
-Libs: -lvulkan-1
-EOF
-```
-
-Note: new w64devkit has no `x86_64-w64-mingw32/` folder; use `$W64DEVKIT_HOME/lib` and `$W64DEVKIT_HOME/include`.
-
-Build (needs CMake in PATH):
-
-```sh
-cd C:/Users/yarudu/Documents/project/llama.cpp
-cmake -B build -G "MinGW Makefiles" -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
-
-### Check devices
-
-```powershell
-.\build\bin\RelWithDebInfo\llama-cli.exe --list-devices
-```
-
-## 2. Download the MAI model
-
-Source: Azure ML registry (MIT license), asset `azureml://registries/azureml/models/MAI-Code-1.1-Flash-On-Device/versions/1`.
-
-Save as `C:\Users\yarudu\mai-code\download.ps1`:
-
-```powershell
-# Never print the SAS URL: it is a time-limited credential.
-$ErrorActionPreference = 'Stop'
-$root = Join-Path $HOME 'mai-code'
-New-Item -ItemType Directory -Force -Path "$root\tools", "$root\models" | Out-Null
-Set-Location $root
-
-$azcopy = "$root\tools\azcopy.exe"
-if (-not (Test-Path $azcopy)) {
-    $zip = "$env:TEMP\azcopy.zip"
-    Invoke-WebRequest -Uri 'https://aka.ms/downloadazcopy-v10-windows' -OutFile $zip -UseBasicParsing
-    Expand-Archive -Path $zip -DestinationPath "$env:TEMP\azcopy" -Force
-    Copy-Item (Get-ChildItem "$env:TEMP\azcopy\azcopy_windows_amd64_*\azcopy.exe" | Select-Object -First 1).FullName $azcopy
-}
-
-$ep = 'https://api.catalog.azureml.ms/modelregistry/v1.0/registry/models/nonazureaccount?assetId=azureml://registries/azureml/models/MAI-Code-1.1-Flash-On-Device/versions/1'
-$sas = (Invoke-RestMethod -Uri $ep).blobSasUri
-if (-not $sas) { throw 'no SAS in registry response' }
-
-$base, $query = $sas -split '\?', 2
-$src = "$base/5/*?$query"
-& $azcopy copy $src "$root\models\" --output-level essential --log-level ERROR
-if ($LASTEXITCODE -ne 0) { throw "azcopy failed ($LASTEXITCODE)" }
-
-Remove-Variable sas, src, base, query
-Get-ChildItem "$root\models" | Format-Table Name, Length
-```
-
-Run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File $HOME\mai-code\download.ps1
-```
-
-Expected in `C:\Users\yarudu\mai-code\models` (~57 GB, ~8.5 min):
-
-| File | Size (bytes) |
-|---|---|
-| `MAI-Code-1.1-Flash-Q2-XS.gguf` | 56,307,620,832 |
-| `dflash-v3-lc1.gguf` (draft model) | 381,214,016 |
-| `llama-config.json` | 504 |
-
-## 3. MAI model summary
+## 1. MAI model summary
 
 Read from GGUF header (`C:\Users\yarudu\mai-code\gguf_info.py`).
 
@@ -193,7 +102,99 @@ Use `-ctk q8_0 -ctv q8_0` to roughly halve it.
 
 ### Draft model (`dflash-v3-lc1.gguf`, ~650M)
 
-## 4. Run commands
+- DFlash block-diffusion drafter, 5 layers, non-causal attention, block size 8.
+- Reads target hidden states from layers 2, 11, 21, 31, 40.
+- Weights Q4_K (+4 Q6_K), F32 norms.
+- KV at 131072 ctx: 512 MiB (1 full layer) + 160 MiB (4 SWA layers, window 8192).
+
+## 2. Windows setup
+
+### 2.1 Download the MAI model
+
+Source: Azure ML registry (MIT license), asset `azureml://registries/azureml/models/MAI-Code-1.1-Flash-On-Device/versions/1`.
+
+Save as `C:\Users\yarudu\mai-code\download.ps1`:
+
+```powershell
+# Never print the SAS URL: it is a time-limited credential.
+$ErrorActionPreference = 'Stop'
+$root = Join-Path $HOME 'mai-code'
+New-Item -ItemType Directory -Force -Path "$root\tools", "$root\models" | Out-Null
+Set-Location $root
+
+$azcopy = "$root\tools\azcopy.exe"
+if (-not (Test-Path $azcopy)) {
+    $zip = "$env:TEMP\azcopy.zip"
+    Invoke-WebRequest -Uri 'https://aka.ms/downloadazcopy-v10-windows' -OutFile $zip -UseBasicParsing
+    Expand-Archive -Path $zip -DestinationPath "$env:TEMP\azcopy" -Force
+    Copy-Item (Get-ChildItem "$env:TEMP\azcopy\azcopy_windows_amd64_*\azcopy.exe" | Select-Object -First 1).FullName $azcopy
+}
+
+$ep = 'https://api.catalog.azureml.ms/modelregistry/v1.0/registry/models/nonazureaccount?assetId=azureml://registries/azureml/models/MAI-Code-1.1-Flash-On-Device/versions/1'
+$sas = (Invoke-RestMethod -Uri $ep).blobSasUri
+if (-not $sas) { throw 'no SAS in registry response' }
+
+$base, $query = $sas -split '\?', 2
+$src = "$base/5/*?$query"
+& $azcopy copy $src "$root\models\" --output-level essential --log-level ERROR
+if ($LASTEXITCODE -ne 0) { throw "azcopy failed ($LASTEXITCODE)" }
+
+Remove-Variable sas, src, base, query
+Get-ChildItem "$root\models" | Format-Table Name, Length
+```
+
+Run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File $HOME\mai-code\download.ps1
+```
+
+Expected in `C:\Users\yarudu\mai-code\models` (~57 GB, ~8.5 min):
+
+| File | Size (bytes) |
+|---|---|
+| `MAI-Code-1.1-Flash-Q2-XS.gguf` | 56,307,620,832 |
+| `dflash-v3-lc1.gguf` (draft model) | 381,214,016 |
+| `llama-config.json` | 504 |
+
+### 2.2 Build llama.cpp (Vulkan, w64devkit / MinGW)
+
+Vulkan SDK: `C:\VulkanSDK\1.4.363.1`. w64devkit: `C:\w64devkit`. One-time Vulkan setup, run inside `C:\w64devkit\w64devkit.exe`:
+
+```sh
+SDK_VERSION=1.4.363.1
+VULKAN_SDK=C:/VulkanSDK/$SDK_VERSION
+W64DEVKIT_HOME=C:/w64devkit
+
+cp "$VULKAN_SDK/Bin/glslc.exe" "$W64DEVKIT_HOME/bin/"
+cp "$VULKAN_SDK/Lib/vulkan-1.lib" "$W64DEVKIT_HOME/lib/"
+cp -r "$VULKAN_SDK/Include/"* "$W64DEVKIT_HOME/include/"
+mkdir -p "$W64DEVKIT_HOME/lib/pkgconfig"
+cat > "$W64DEVKIT_HOME/lib/pkgconfig/vulkan.pc" <<EOF
+Name: Vulkan-Loader
+Description: Vulkan Loader
+Version: $SDK_VERSION
+Libs: -lvulkan-1
+EOF
+```
+
+Note: new w64devkit has no `x86_64-w64-mingw32/` folder; use `$W64DEVKIT_HOME/lib` and `$W64DEVKIT_HOME/include`.
+
+Build (needs CMake in PATH):
+
+```sh
+cd C:/Users/yarudu/Documents/project/llama.cpp
+cmake -B build -G "MinGW Makefiles" -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+Check devices:
+
+```powershell
+.\build\bin\RelWithDebInfo\llama-cli.exe --list-devices
+```
+
+### 2.3 Run commands
 
 Local dev configuration:
 
@@ -213,7 +214,7 @@ $B = "C:\Users\yarudu\Documents\project\llama.cpp\build\bin\RelWithDebInfo"
 
 Use `llama-server.exe` for HTTP (web UI at http://127.0.0.1:8080, OpenAI API at `/v1/chat/completions`) or `llama-cli.exe` for terminal chat (same flags, drop `--host`/`--port`).
 
-### 4.1 One GPU: dGPU + experts on CPU (local dev)
+#### 2.3.1 One GPU: dGPU + experts on CPU (local dev)
 
 Model (56 GB) does not fit in 12 GB dGPU. `--cpu-moe` keeps expert weights (~54 GB) in RAM on CPU; everything else on dGPU.
 
@@ -227,7 +228,7 @@ Model (56 GB) does not fit in 12 GB dGPU. `--cpu-moe` keeps expert weights (~54 
 
 Result: No output, functional issue. `$env:GGML_VK_DISABLE_COOPMAT = 1` fixed the issue, perf 7TPS. 
 
-#### Finding: wrong output from Vulkan coopmat matmul on dGPU
+##### Finding: wrong output from Vulkan coopmat matmul on dGPU
 
 Summary:
 
@@ -280,7 +281,7 @@ Test-Prompt 'chat' $p
 
 Next: find which matmul (weight type + shape) gives NaN, for a small repro; retest with a newer Intel driver; report to llama.cpp / Intel if it still fails.
 
-### 4.2 One GPU: iGPU only (local dev)
+#### 2.3.2 One GPU: iGPU only (local dev)
 
 ```powershell
 & "$B\llama-server.exe" -m "$M\MAI-Code-1.1-Flash-Q2-XS.gguf" -md "$M\dflash-v3-lc1.gguf" `
@@ -294,7 +295,7 @@ Result: functionally work, perf 5TPS.
 
 Note: only ~34 GB lands on the iGPU (29.6 GB weights + 3.9 GB KV + 1.3 GB compute). All 21 `ffn_down_exps` tensors (Q4_0, 1134 MiB each, 23.8 GB total) fall back to CPU (`CPU_REPACK` buffer) because they exceed the iGPU `maxStorageBufferRange` (~1 GiB). See `ggml_backend_vk_device_supports_op()` in `ggml/src/ggml-vulkan/ggml-vulkan.cpp`. This causes GPU<->CPU transfer in each MoE layer.
 
-### 4.3 Multi GPU: dGPU + iGPU (local dev)
+#### 2.3.3 Multi GPU: dGPU + iGPU (local dev)
 
 ```powershell
 & "$B\llama-server.exe" -m "$M\MAI-Code-1.1-Flash-Q2-XS.gguf" -md "$M\dflash-v3-lc1.gguf" `
@@ -306,7 +307,7 @@ Note: only ~34 GB lands on the iGPU (29.6 GB weights + 3.9 GB KV + 1.3 GB comput
 
 Result: functionally work, perf 5TPS.
 
-### 4.4 Multi GPU: dGPU + dGPU ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
+#### 2.3.4 Multi GPU: dGPU + dGPU ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
 
 Machine: 2x Intel Arc B70 (Battlemage G31), 32 GB each.
 
@@ -317,9 +318,9 @@ $B = "C:\Users\gta\Documents\project\llama"
  & "$B\llama-server.exe" -m "$M\MAI-Code-1.1-Flash-Q2-XS.gguf" -md "$M\dflash-v3-lc1.gguf" -ngl 999 -fa on -np 1 --no-host --fit off -sm layer -c 131072 -ctk f16 -ctv f16 -b 2048 -ub 1024 `
  --spec-type draft-dflash --spec-draft-ngl all --spec-draft-n-max 2 --spec-draft-p-min 0.2 --ctx-checkpoints 0
 ```
-Result: doesn't work, because of section 3.1 issue.
+Result: doesn't work, because of the 2.3.1 issue.
 
-### Flag reference (from `llama-config.json`)
+#### Flag reference (from `llama-config.json`)
 
 | Flag | Meaning |
 |---|---|
@@ -341,14 +342,7 @@ Result: doesn't work, because of section 3.1 issue.
 | `-sm layer` / `-ts a,b` | Split mode / split ratio across GPUs |
 | `-lv 4` | Verbose log |
 
-
-
-- DFlash block-diffusion drafter, 5 layers, non-causal attention, block size 8.
-- Reads target hidden states from layers 2, 11, 21, 31, 40.
-- Weights Q4_K (+4 Q6_K), F32 norms.
-- KV at 131072 ctx: 512 MiB (1 full layer) + 160 MiB (4 SWA layers, window 8192).
-
-## 5. Linux: 2x Intel Battlemage G31 ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
+## 3. Linux: 2x Intel Battlemage G31 ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
 
 Machine: Linux, 2x Intel Arc B70 (Battlemage G31) dGPU, 32 GB each (`xe` kernel driver) + ASPEED BMC VGA.
 
@@ -358,7 +352,7 @@ Quickly check if mesa driver is available
 apt-cache policy mesa-vulkan-drivers   # we got 26.2.5~kisak1~n
 ```
 
-### 5.1 Build tools
+### 3.1 Build tools
 
 ```bash
 sudo apt-get install -y glslc vulkan-tools ninja-build spirv-headers libcurl4-openssl-dev
@@ -366,7 +360,7 @@ sudo apt-get install -y glslc vulkan-tools ninja-build spirv-headers libcurl4-op
 
 `git`, `cmake` and a C++ compiler (GCC 13.3) were already installed on our machine. Install them if yours does not have them.
 
-### 5.2 LunarG Vulkan SDK (only for its shader compiler)
+### 3.2 LunarG Vulkan SDK (only for its shader compiler)
 
 Ubuntu 24.04's `glslc` cannot build the integer-dot shaders, which add 19–25% generation speed.
 
@@ -377,7 +371,7 @@ tar -xJf vulkan_sdk.tar.xz -C vulkan-sdk
 ls vulkan-sdk   # we got 1.4.363.0
 ```
 
-### 5.3 Build
+### 3.3 Build
 
 ```bash
 source /home/gta/mai-code/tools/vulkan-sdk/1.4.363.1/setup-env.sh
@@ -385,7 +379,7 @@ cmake -B build-vk-sdk -DGGML_VULKAN=ON -DVulkan_GLSLC_EXECUTABLE=$VULKAN_SDK/bin
 cmake --build build-vk-sdk -j 16
 ```
 
-### 5.4 Check GPU usage
+### 3.4 Check GPU usage
 
 `sudo intel_gpu_top` fails with `no discrete/integrated i915 devices found`: Battlemage uses the `xe` driver, older `intel_gpu_top` supports only i915. `/sys/class/drm/card*/device/gpu_busy_percent` is also empty.
 
@@ -403,7 +397,7 @@ igt-gpu-tools >= 2.0 `intel_gpu_top` also supports xe.
 
 High CPU (~97%) on `llama-server` with `-ngl 999` is normal: the main thread spins while waiting for the GPU. Confirm offload in the log (`offloaded X/X layers to GPU`).
 
-### 5.5 Run commands
+### 3.5 Run commands
 
 Layer split (works, with DFlash draft):
 
@@ -432,7 +426,7 @@ $B/llama-server -m $M -ngl 999 -fa on -np 1 --no-host --fit off -sm tensor -c 13
 
 Optional: `-ts 1,1` for an even split; `GGML_VK_VISIBLE_DEVICES=0,1` to use only the two Vulkan GPUs. `-sm tensor` fails at load with `LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'` if the arch is not supported.
 
-### 5.6 Crash: `-sm tensor` + DFlash draft
+### 3.6 Crash: `-sm tensor` + DFlash draft
 
 ```
 init: DFlash target features via device buffer
@@ -444,14 +438,16 @@ Meaning: in tensor mode a tensor is split along axis 0 (hidden dim) across GPUs.
 
 Next steps:
 
-1. Run `-sm tensor` without the draft model (5.5). If it works, the problem is DFlash + tensor split. If it still crashes, the main model graph has an op that tensor mode does not support yet.
+1. Run `-sm tensor` without the draft model (3.5). If it works, the problem is DFlash + tensor split. If it still crashes, the main model graph has an op that tensor mode does not support yet.
 2. For a symbolized backtrace: `cmake -B build-vk-dbg -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build-vk-dbg -j 16`.
 3. Workaround: `-sm layer` with DFlash, or `-sm tensor` without the draft model. Compare tokens/s.
 4. Search llama.cpp issues for "split-mode tensor" + dflash/speculative; report with the backtrace and a minimal command if none exists.
 
-## 6. Status: 2x dGPU results
+## 4. Summary
+
+2x dGPU results:
 
 | `-sm` | Linux with draft | Linux without draft | Linux GPU usage | Windows with draft | Windows without draft |
 |---|---|---|---|---|---|
-| `layer` | 74 t/s | 70 t/s | 30% ; 52% | not functional (see 4.1) | |
-| `tensor` | failed (see 5.6) | 25 t/s | 54%; 54% | | |
+| `layer` | 74 t/s | 70 t/s | 30% ; 52% | not functional (see 2.3.1) | |
+| `tensor` | failed (see 3.6) | 25 t/s | 54%; 54% | | |
