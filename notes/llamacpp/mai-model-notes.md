@@ -195,6 +195,15 @@ Use `-ctk q8_0 -ctv q8_0` to roughly halve it.
 
 ## 4. Run commands
 
+Local dev configuration:
+
+| Item | Value |
+|---|---|
+| RAM | 128 GB |
+| CPU | Intel Alder Lake (ADL) |
+| iGPU | ADL iGPU (Vulkan1) |
+| dGPU | Intel Arc B580, 12 GB (Vulkan0) |
+
 Common variables:
 
 ```powershell
@@ -298,6 +307,9 @@ Note: only ~34 GB lands on the iGPU (29.6 GB weights + 3.9 GB KV + 1.3 GB comput
 Result: functionally work, perf 5TPS.
 
 ### 4.4 Multi GPU: dGPU + dGPU ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
+
+Machine: 2x Intel Arc B70 (Battlemage G31), 32 GB each.
+
 ```powershell
 $M = "C:\Users\gta\Documents\Models\mai-code\models"
 $B = "C:\Users\gta\Documents\project\llama"
@@ -338,7 +350,7 @@ Result: doesn't work, because of section 3.1 issue.
 
 ## 5. Linux: 2x Intel Battlemage G31 ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
 
-Machine: Linux, 2x Intel Battlemage G31 dGPU (`xe` kernel driver) + ASPEED BMC VGA.
+Machine: Linux, 2x Intel Arc B70 (Battlemage G31) dGPU, 32 GB each (`xe` kernel driver) + ASPEED BMC VGA.
 
 Quickly check if mesa driver is available 
 
