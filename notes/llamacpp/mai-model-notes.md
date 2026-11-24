@@ -279,7 +279,74 @@ Test-Prompt 'chat' $p
 5. Restart the server for each test and change one thing at a time: remove `-md`/`--spec-*`, `-fa off`, `--no-op-offload`, `-ub 8` / `-ub 16`, then env vars `GGML_VK_DISABLE_COOPMAT`, `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT`, `GGML_VK_DISABLE_FUSION`.
 6. Check kernels alone: `test-backend-ops.exe -b Vulkan0 -o MUL_MAT` (also `MUL_MAT_ID`, `FLASH_ATTN_EXT`, `ROPE`, `RMS_NORM`, ...).
 
-Next: find which matmul (weight type + shape) gives NaN, for a small repro; retest with a newer Intel driver; report to llama.cpp / Intel if it still fails.
+7. Find the first NaN tensor: dump every graph node with `llama-eval-callback` (16-token prompt, so the matmul path is used), then search the log for the first `sum = .*nan`:
+
+```powershell
+& "$B\llama-eval-callback.exe" -m "$M\MAI-Code-1.1-Flash-Q2-XS.gguf" -dev Vulkan0 -ngl 999 --cpu-moe -c 4096 -b 64 -ub 64 -fa on -fit off `
+  -p "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over" -n 1 *> $HOME\mai-code\evalcb_coopmat.log
+Select-String -Path $HOME\mai-code\evalcb_coopmat.log -Pattern 'sum = .*nan' | Select-Object -First 1
+```
+
+##### Result: first NaN tensor
+
+All layers 0-39 are finite. First NaN is the dense FFN down projection of layer 40:
+
+```
+node_2187 = (f32) MUL_MAT(blk.40.ffn_down.weight{3584, 3584, 1, 1}, ffn_swiglu-40{3584, 16, 1, 1}) = {3584, 16, 1, 1}
+```
+
+| Item | Value |
+|---|---|
+| src0 (weight) | `blk.40.ffn_down.weight`, Q3_K, 3584 x 3584 |
+| src1 (activation) | `ffn_swiglu-40`, F32, 3584 x 16, outliers up to ~381 |
+| dst | F32, 3584 x 16 |
+| coopmat ON | `sum = -nan(ind)`; values have f16 rounding (`1229.0000`, `-948.0000`) |
+| coopmat OFF | `sum = -2386052.0`, no NaN in whole graph (`1243.9910`, `-939.0754`) |
+
+Cause (likely): on Intel coopmat1, quant matmul uses f16 accumulator (`ggml_vk_get_mul_mat_mat_f16acc()`, `coopmat_acc_f16_support`) and f16 B (`prefer_f16_b` in `ggml_vk_mul_mat_q_f16`). Large layer-40 activations overflow f16 (> 65504) -> inf -> NaN in the next RMS_NORM. `test-backend-ops` passes because random inputs in [-1, 1] never reach f16 range limit.
+
+Small repro: `test_mul_mat_large_b` in `tests/test-backend-ops.cpp` (q3_K x f32, m=3584, n=16, k=3584, src1 uniform in [-b_max, b_max]):
+
+```powershell
+cmake --build build --config RelWithDebInfo --target test-backend-ops -j
+.\build\bin\RelWithDebInfo\test-backend-ops.exe -b Vulkan0 -o MUL_MAT -p "b_max"
+$env:GGML_VK_DISABLE_COOPMAT = 1; .\build\bin\RelWithDebInfo\test-backend-ops.exe -b Vulkan0 -o MUL_MAT -p "b_max"; Remove-Item Env:GGML_VK_DISABLE_COOPMAT
+```
+
+| b_max | coopmat ON | coopmat OFF |
+|---|---|---|
+| 1 | OK | OK |
+| 300 | OK | OK |
+| 1000 | FAIL: `inf mismatch: Vulkan0=inf CPU=66628.82` | OK |
+
+Confirmed: f16 overflow (CPU value 66628 > f16 max 65504).
+
+Kernel used (from `$env:GGML_VK_PIPELINE_STATS = "m"` + `-p "b_max=1000"`): `matmul_quant_f16_f16acc_aligned_0`, coopmat1 (`KHR_coopmat`), B converted to f16, f16 accumulator. Created by `cm1_create_quant(..., "matmul_quant_f16_f16acc", ...)` in `ggml_vk_load_shaders()` when `coopmat_acc_f16_support`. One run also failed with `Vulkan0=-inf CPU=-51741`, so partial sums inside the kernel overflow even when the final value fits in f16.
+
+Saved input data: set `GGML_TEST_MM_DATA=<file>`. If the file does not exist, the test saves its random `a` (raw Q3_K blocks, 5,519,360 B) and `b` (raw f32, 229,376 B) to it; if it exists, the test loads them. File: `mm_q3k_fail.bin` in the llama.cpp repo root (5,748,736 B), fails every run with `Vulkan0=inf CPU=60344.59`. Raw little-endian bytes, so it works on Windows and Linux x86/ARM.
+
+```powershell
+$env:GGML_TEST_MM_DATA = "mm_q3k_fail.bin"
+.\build\bin\RelWithDebInfo\test-backend-ops.exe -b Vulkan0 -o MUL_MAT -p "b_max=1000"
+```
+
+```bash
+GGML_TEST_MM_DATA=mm_q3k_fail.bin ./build-vk-sdk/bin/test-backend-ops -b Vulkan0 -o MUL_MAT -p "b_max=1000"
+```
+
+Accumulator check on Windows (saved input, `GGML_VK_PIPELINE_STATS=matmul`; `GGML_TEST_MM_F32ACC=1` sets `GGML_PREC_F32` acc on the test matmul):
+
+| Case | Pipeline | Result |
+|---|---|---|
+| default | `matmul_quant_f16_f16acc_aligned_0` (coopmat, f16 acc) | FAIL `inf` vs CPU 60344.59 |
+| `GGML_TEST_MM_F32ACC=1` | `matmul_quant_f16_aligned_0` (coopmat, f32 acc) | OK |
+| `GGML_VK_DISABLE_COOPMAT=1` | `matmul_q3_k_q8_1_0` (int dot, no coopmat) | OK |
+
+Linux Mesa runs the same test OK, also with f16 acc (`dpas.8x8 ... :hf`). So f16 acc alone is not enough; Windows driver f16 acc coopmat path is the suspect.
+
+Possible fixes to try: set `GGML_PREC_F32` acc on this matmul (`ggml_prec_set_acc`), or disable f16acc for Intel coopmat quant matmul.
+
+Next: retest with a newer Intel driver; report to llama.cpp / Intel if it still fails.
 
 #### 2.3.2 One GPU: iGPU only (local dev)
 
@@ -309,16 +376,43 @@ Result: functionally work, perf 5TPS.
 
 #### 2.3.4 Multi GPU: dGPU + dGPU ([FM-RIL-GNR-G31-006](https://gtax-ril-fm.intel.com/#/clients/18529))
 
-Machine: 2x Intel Arc B70 (Battlemage G31), 32 GB each.
+Machine: Windows, 2x Intel Arc B70 (Battlemage G31), 32 GB each (32,558 MiB reported per adapter). The local `win_bug` build was tested with the MAION_CODER FFN down-matmul f32 accumulator fix enabled by `GGML_TEST_MM_F32ACC=1` (see 2.3.1).
 
-```powershell
-$M = "C:\Users\gta\Documents\Models\mai-code\models"
-$B = "C:\Users\gta\Documents\project\llama"
+Reproduce with the [PowerShell runner](../../.copilot/session-state/15834ec8-0341-49fe-975a-4c26e8cf1010/files/mai-context-benchmark.ps1) (`-SplitMode layer` or `-SplitMode tensor`). The [benchmark CSV](../../.copilot/session-state/15834ec8-0341-49fe-975a-4c26e8cf1010/files/mai-context-benchmark.csv) contains the launch commands, exact timings, idle and peak memory counters, and startup errors. Layer commands were reconstructed; exact temporary ports were not recorded for every layer configuration.
 
- & "$B\llama-server.exe" -m "$M\MAI-Code-1.1-Flash-Q2-XS.gguf" -md "$M\dflash-v3-lc1.gguf" -ngl 999 -fa on -np 1 --no-host --fit off -sm layer -c 131072 -ctk f16 -ctv f16 -b 2048 -ub 1024 `
- --spec-type draft-dflash --spec-draft-ngl all --spec-draft-n-max 2 --spec-draft-p-min 0.2 --ctx-checkpoints 0
-```
-Result: doesn't work, because of the 2.3.1 issue.
+**Benchmark:** one request per row, one slot, f16 KV, `-b 2048 -ub 1024`, prompt caching disabled, 64 generated tokens. The 128K and 256K values are configured context sizes (131,072 and 262,144 tokens); the longest prompt tested was 8,192 tokens. Tensor split was tested without DFlash only.
+
+**Memory columns:** sampled request peaks in GiB. GPU pairs are Vulkan0 / Vulkan1. Dedicated VRAM is adapter-wide; shared RAM is system memory attributed to the server by Windows per GPU. Host RAM is system-wide, includes shared memory, and was about 14.1 GiB before launch. Do not add these columns together; peaks can occur at different times. `0.00` means rounded to two decimals. GPU engine utilization (%) was not collected.
+
+| Split | Context | Flash Attn | DFlash | Prompt tokens | Prefill tok/s | Decode tok/s | dGPU dedicated VRAM (GiB) | dGPU shared RAM (GiB) | Host RAM (GiB) |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| layer | 128K | on | off | 256 | 221 | 75.7 | 30.94 / 28.77 | 0.91 / 0.00 | 67.79 |
+| layer | 128K | on | off | 8,192 | 1,930 | 69.5 | 31.03 / 28.86 | 0.92 / 0.01 | 67.96 |
+| layer | 128K | on | on | 256 | 162 | 87.1 | 31.43 / 31.42 | 1.74 / 1.40 | 69.67 |
+| layer | 128K | on | on | 8,192 | 1,403 | 81.9 | 31.48 / 31.54 | 1.75 / 1.41 | 69.80 |
+| layer | 128K | off | off | 256 | 165 | 66.5 | 30.31 / 28.28 | 1.00 / 0.00 | 67.95 |
+| layer | 128K | off | off | 8,192 | 847 | 41.6 | 31.37 / 29.70 | 2.51 / 0.00 | 69.62 |
+| layer | 128K | off | on | 256 | 139 | 74.4 | 29.87 / 31.57 | 6.31 / 2.71 | 75.45 |
+| layer | 128K | off | on | 8,192 | 344 | 39.6 | 31.54 / 31.57 | 6.88 / 5.00 | 78.44 |
+| layer | 256K | on | off | 256 | 242 | 64.3 | 31.49 / 31.78 | 2.63 / 0.00 | 69.59 |
+| layer | 256K | on | off | 8,192 | 567 | 60.6 | 31.51 / 31.78 | 2.64 / 0.05 | 69.76 |
+| layer | 256K | on | on | 256 | 115 | 73.5 | 31.48 / 31.38 | 4.08 / 5.64 | 76.52 |
+| layer | 256K | on | on | 8,192 | 1,031 | 61.4 | 31.51 / 31.50 | 3.83 / 5.65 | 76.51 |
+| layer | 256K | off | off | 256 | 290 | 50.9 | 30.95 / 30.28 | 1.92 / 0.00 | 68.94 |
+| layer | 256K | off | off | 8,192 | 393 | 26.2 | 31.07 / 31.29 | 3.27 / 1.50 | 71.83 |
+| layer | 256K | off | on | 256 | 147 | 67.1 | 30.92 / 31.66 | 1.94 / 5.13 | 74.51 |
+| layer | 256K | off | on | 8,192 | 270 | 34.8 | 31.08 / 31.66 | 3.28 / 7.09 | 77.95 |
+| tensor | 128K | on | off | 256 | 753 | 10.7 | 29.51 / 28.73 | 0.00 / 0.00 | 66.67 |
+| tensor | 128K | on | off | 8,192 | 1,524 | 10.4 | 29.58 / 28.78 | 0.01 / 0.01 | 66.78 |
+| tensor | 128K | off | off | 256 / 8,192 | Startup failed | N/A | N/A | N/A | N/A |
+| tensor | 256K | on | off | 256 | 545 | 6.7 | 31.52 / 30.73 | 0.00 / 0.00 | 66.09 |
+| tensor | 256K | on | off | 8,192 | 1,488 | 7.1 | 31.55 / 30.78 | 0.01 / 0.01 | 66.19 |
+| tensor | 256K | off | off | 256 / 8,192 | Startup failed | N/A | N/A | N/A | N/A |
+
+- **Layer split:** Flash Attention improved both prefill and decode in every 8K comparison. At 128K, DFlash traded prefill speed (1,930 -> 1,403 tok/s) for faster decode (69.5 -> 81.9 tok/s). At 256K, DFlash improved 8K prefill in this run (567 -> 1,031 tok/s) but barely changed decode (60.6 -> 61.4 tok/s), with higher RAM use. DFlash accepted all 42 draft tokens per synthetic request; gains may differ on real prompts.
+- **Tensor split:** Flash Attention off failed during context creation at both context sizes, before either prompt could run. With Flash Attention on, tensor split nearly eliminated shared GPU RAM use, but decode was much slower than layer split. At 256K without DFlash, 8K prefill improved from 567 to 1,488 tok/s while decode fell from 60.6 to 7.1 tok/s.
+- **VRAM headroom:** Separate idle checks with layer split, Flash Attention, and DFlash showed 461-487 MiB / 65 MiB free at 128K, and 267 MiB / 40 MiB at 256K. The 256K check reported 8.64 GiB of shared GPU RAM across the two adapters at idle. These are counter-based headroom estimates, not Vulkan allocation guarantees.
+- **Host RAM:** With 128K layer split, Flash Attention on, and DFlash off, system RAM reached 67.7 GiB before the first prompt and 68.0 GiB during the 8K request. The 52.44 GiB GGUF is memory-mapped, so resident file-backed weight pages likely account for most of the increase; the counters do not isolate those pages from private or driver allocations. `--no-host` does not prevent model-file mapping or shared GPU memory.
 
 #### Flag reference (from `llama-config.json`)
 
@@ -445,9 +539,11 @@ Next steps:
 
 ## 4. Summary
 
-2x dGPU results:
+Windows 2x dGPU results are in [section 2.3.4](#234-multi-gpu-dgpu--dgpu-fm-ril-gnr-g31-006).
 
-| `-sm` | Linux with draft | Linux without draft | Linux GPU usage | Windows with draft | Windows without draft |
-|---|---|---|---|---|---|
-| `layer` | 74 t/s | 70 t/s | 30% ; 52% | not functional (see 2.3.1) | |
-| `tensor` | failed (see 3.6) | 25 t/s | 54%; 54% | | |
+Linux 2x dGPU results:
+
+| `-sm` | With draft | Without draft | GPU utilization |
+|---|---|---|---|
+| `layer` | 74 t/s | 70 t/s | 30%; 52% |
+| `tensor` | failed (see 3.6) | 25 t/s | 54%; 54% |

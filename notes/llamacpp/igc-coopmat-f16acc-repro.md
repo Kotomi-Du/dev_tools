@@ -30,7 +30,7 @@
 
 The shape is from the MAI-Code model (`blk.40.ffn_down`). The kernel converts B to f16 and accumulates in f16.
 
-Input data: `mm_q3k_fail.bin` in the llama.cpp repo root, 5,748,736 bytes. It holds raw A bytes (Q3_K blocks, 5,519,360 B) followed by raw B bytes (f32 little-endian, 229,376 B). SHA256: `C1F7E3BB2AFEF9F6EB4E3FAEF4C007E60C8F4BD19360D9C6C4A97C0DD89C559C`.
+Input data: [mm_q3k_fail.bin](https://github.com/Kotomi-Du/llama.cpp/blob/win_bug/mm_q3k_fail.bin) in the llama.cpp repo root (`<llama.cpp>/mm_q3k_fail.bin`), 5,748,736 bytes. It holds raw A bytes (Q3_K blocks, 5,519,360 B) followed by raw B bytes (f32 little-endian, 229,376 B). SHA256: `C1F7E3BB2AFEF9F6EB4E3FAEF4C007E60C8F4BD19360D9C6C4A97C0DD89C559C`.
 
 ## Steps
 
@@ -76,7 +76,7 @@ Remove-Item Env:GGML_VK_DISABLE_COOPMAT
 ```
 
 ```bash
-# Linux Mesa, same branch and input file
+# Linux Mesa, same branch and input file (run from llama.cpp repo root)
 GGML_TEST_MM_DATA=mm_q3k_fail.bin ./build-vk-sdk/bin/test-backend-ops -b Vulkan0 -o MUL_MAT -p "b_max=1000"
 ```
 
