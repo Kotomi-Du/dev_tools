@@ -530,20 +530,75 @@ ggml/src/ggml-backend-meta.cpp:573: GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_S
 
 Meaning: in tensor mode a tensor is split along axis 0 (hidden dim) across GPUs. Per-row ops (norm, softmax, get_rows, ...) need full rows on each GPU, so the meta backend asserts. It fires on the first test decode, right after DFlash sets up reading target hidden states from device buffers. Likely cause: DFlash speculative decoding does not support `-sm tensor` yet (a llama.cpp bug, not a command-line error).
 
-Next steps:
+### 3.7 benchmark report
+#### Setup
 
-1. Run `-sm tensor` without the draft model (3.5). If it works, the problem is DFlash + tensor split. If it still crashes, the main model graph has an op that tensor mode does not support yet.
-2. For a symbolized backtrace: `cmake -B build-vk-dbg -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build-vk-dbg -j 16`.
-3. Workaround: `-sm layer` with DFlash, or `-sm tensor` without the draft model. Compare tokens/s.
-4. Search llama.cpp issues for "split-mode tensor" + dflash/speculative; report with the backtrace and a minimal command if none exists.
+- Hardware: two Intel Arc B70 GPUs with Mesa 26.2.4-1ubuntu1~26.04.1; Linux Vulkan build 12307 (36221eedc).
+- Server: one slot, f16 KV, `-b 2048 -ub 1024`, `--no-host --fit off --ctx-checkpoints 0 --no-cache-prompt`, following the attached PowerShell runner.
+- Requests: 256 and 8192 synthetic prompt tokens per launch, 64 output tokens, `temperature=0`, `seed=42`, `ignore_eos=true`, and `cache_prompt=false`.
+- Modes: layer split with and without DFlash; tensor split without DFlash. The table includes successful runs with `GGML_TEST_MM_F32ACC` unset; the summary compares runs with the flag set to `1`.
+
+#### Memory measurements
+
+- GTT GiB: the server process's GPU-accessible system-memory residency from Intel `xe` DRM `drm-resident-gtt` in `/proc/<pid>/fdinfo/*`.
+- VRAM GiB: per-process `drm-resident-vram0` from the same files. GPU pairs are in PCI order 0000:17:00.0 / 0000:ba:00.0; these are not Windows adapter-wide counters.
+- Host used GiB: system-wide `MemTotal - MemAvailable` from `/proc/meminfo`, not the server's RSS or mapped model size. Reclaimable model-file pages may be resident without increasing this value by their full size; do not add it to GPU residency.
+- Sampling: GPU and host peaks were sampled about once per second during each request, not during startup.
+- Raw data: [results.jsonl](results.jsonl) retains commands, environment, timings, full completion text, per-request peaks, failures, and server log paths.
+
+| Split | Context | Flash | Draft | Prompt | Prefill tok/s | Decode tok/s | VRAM GiB (PCI pair) | GTT GiB (PCI pair) | Host used GiB |
+|---|---:|---|---|---:|---:|---:|---|---|---:|
+| layer | 128K | on | off | 256 | 512 | 72.9 | 30.26 / 28.66 | 0.01 / 0.00 | 7.43 |
+| layer | 128K | on | off | 8192 | 1691 | 58.4 | 30.29 / 28.70 | 0.02 / 0.00 | 7.52 |
+| layer | 128K | on | on | 256 | 263 | 108.0 | 30.80 / 31.75 | 0.01 / 0.01 | 8.42 |
+| layer | 128K | on | on | 8192 | 1271 | 92.4 | 30.84 / 31.82 | 0.02 / 0.02 | 8.51 |
+| layer | 128K | off | off | 256 | 386 | 69.0 | 29.69 / 28.23 | 0.01 / 0.00 | 7.43 |
+| layer | 128K | off | off | 8192 | 1022 | 54.9 | 31.17 / 29.60 | 0.02 / 0.00 | 7.63 |
+| layer | 128K | off | on | 256 | 179 | 78.6 | 31.82 / 31.14 | 0.01 / 0.01 | 8.48 |
+| layer | 256K | on | off | 256 | 511 | 73.9 | 31.05 / 30.10 | 0.01 / 0.00 | 7.03 |
+| layer | 256K | on | off | 8192 | 1684 | 65.0 | 31.08 / 30.13 | 0.02 / 0.00 | 7.10 |
+| layer | 256K | off | off | 256 | 513 | 70.4 | 31.20 / 30.23 | 0.01 / 0.00 | 7.50 |
+| tensor | 128K | on | off | 256 | 599 | 29.9 | 28.77 / 28.65 | 0.00 / 0.00 | 6.56 |
+| tensor | 128K | on | off | 8192 | 1165 | 31.8 | 28.82 / 28.70 | 0.00 / 0.00 | 6.71 |
+| tensor | 256K | on | off | 256 | 600 | 31.6 | 30.77 / 30.65 | 0.00 / 0.00 | 6.60 |
+| tensor | 256K | on | off | 8192 | 1170 | 31.2 | 30.82 / 30.70 | 0.00 / 0.00 | 6.74 |
+
+
+#### Summary
+
+- 128K, Flash Attention on, 8K prompt: layer split without DFlash reached 1691 prefill / 58.4 decode tok/s; with DFlash it reached 1271 / 92.4 tok/s; tensor split without DFlash reached 1165 / 31.8 tok/s.
+- 256K, Flash Attention on, 8K prompt, no DFlash: layer split reached 1684 prefill / 65.0 decode tok/s versus tensor split at 1170 / 31.2 tok/s.
+- F32 accumulator: across 14 configurations where both settings succeeded, `GGML_TEST_MM_F32ACC=1` changed median prefill by +1.0% and median decode by -0.1% versus unset. Pairs varied (prefill -22.7% to +26.6%; decode -6.1% to +29.1%) without a consistent direction or change in success/failure.
+- Unsupported configuration: tensor split with Flash Attention off exits during context creation (`SPLIT_MODE_TENSOR requires flash_attn to be enabled`) at 128K and 256K.
+- GPU allocation or device loss: layer split at 256K with DFlash failed at startup with either flash mode; layer 128K with Flash Attention off and DFlash failed on the 8K request (`ErrorDeviceLost` after allocation failures); layer 256K with Flash Attention off and no DFlash failed to reserve graph buffers on the 8K request (`ErrorOutOfDeviceMemory`). 
 
 ## 4. Summary
 
-Windows 2x dGPU results are in [section 2.3.4](#234-multi-gpu-dgpu--dgpu-fm-ril-gnr-g31-006).
+Best 256K config per split mode and prompt size on 2x Arc B70 (64GB DRAM), from [section 2.3.4](#234-multi-gpu-dgpu--dgpu-fm-ril-gnr-g31-006) (Windows) and [section 3.7](#37-benchmark-report) (Linux). All use `-c 262144`, f16 KV, `-b 2048 -ub 1024`, 64 output tokens. "Best" = highest decode tok/s; prefill-best is listed when it is a different config.
 
-Linux 2x dGPU results:
+| OS | `-sm` | Prompt | Best config (FA, DFlash) | Prefill tok/s | Decode tok/s | Prefill-best alternative |
+|---|---|---:|---|---:|---:|---|
+| Windows | layer | 256 | on, on | 115 | 73.5 | FA off, no DFlash: 290 / 50.9 |
+| Windows | layer | 8K | on, on | 1,031 | 61.4 | - |
+| Windows | tensor | 256 | on, off | 545 | 6.7 | - |
+| Windows | tensor | 8K | on, off | 1,488 | 7.1 | - |
+| Linux | layer | 256 | on, off | 511 | 73.9 | FA off, no DFlash: 513 / 70.4 |
+| Linux | layer | 8K | on, off | 1,684 | 65.0 | - |
+| Linux | tensor | 256 | on, off | 600 | 31.6 | - |
+| Linux | tensor | 8K | on, off | 1,170 | 31.2 | - |
 
-| `-sm` | With draft | Without draft | GPU utilization |
-|---|---|---|---|
-| `layer` | 74 t/s | 70 t/s | 30%; 52% |
-| `tensor` | failed (see 3.6) | 25 t/s | 54%; 54% |
+- Windows is not sensitive when DRAM is overflow because shared system RAM can be a backup while linux will fail with `ErrorOutOfDeviceMemory`. The performance meets to the requirement 50TPS. Linux has better performance than windows.
+- Flash Attention improves prefill and decode, and reduces memory for long prompts (8K); for short prompts memory is about the same. DFlash improves decode but usually lowers prefill and always uses more memory (at 256K on Linux it does not fit).
+- Tensor split: needs Flash Attention on, does not work with DFlash (see 3.6), and decodes far slower than layer split (Linux ~31 tok/s, Windows ~7 tok/s). It gives the best Windows 8K prefill (1,488 tok/s) and near-zero shared GPU RAM / GTT.
+- Linux layer split, Flash Attention off, 8K prompt fails with `ErrorOutOfDeviceMemory`; keep Flash Attention on at 256K.
+- 128K is faster than 256K on windows, not the case for linux. One possible cause of the Windows gap: at 256K, Windows uses more shared system RAM (about 2-5 GiB on GPU0 vs about 1 GiB at 128K). The VRAM is close to full, so some memory traffic probably goes over PCIe. On Linux, GTT stays near 0 at both sizes.
+- Does two-dGPU configuration improve the performance? yes, because CPU moe is too slow. At 128K with an 8K prompt and DFlash on, layer split reached 92.4 tok/s versus 53.2 tok/s on one dGPU, about 1.7× faster.
+- Profiling notes: [Layer split vs tensor split: two-GPU decode profiling](layer-vs-tensor-split-profiling.md)
+
+## Next Step
+1. use MSFT CGC API
+2. profiling computation bottleneck for tensor split
+3. try oneccl for peer to peer GPU communication
+4. KV cache int8
+5. create taskML to report benchmark data with customized binary
+
