@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Layer split vs tensor split: two-GPU decode profiling</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: "default" });</script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #222; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: .3rem; }
+  h2 { margin-top: 2.5rem; border-bottom: 1px solid #ccc; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  th, td { border: 1px solid #ccc; padding: .35rem .7rem; }
+  th { background: #f2f2f2; }
+  td.n { text-align: right; }
+  code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
+  .box { background: #f7f9fc; border-left: 4px solid #3b6fd8; padding: .8rem 1.2rem; margin: 1rem 0; }
+  .note { color: #666; font-size: .9rem; }
+  .mermaid { background: #fff; margin: 1rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Layer split vs tensor split: two-GPU decode profiling</h1>
+
+<h2>1. Conclusions</h2>
+<div class="box" style="border-left-color:#d83b3b; background:#fdf6f6;">
+<b>Key takeaway: this model is too light per token for tensor split.</b> The MoE activates only 8 of 512 experts, so a decode token reads only about <b>2.8–2.9 GB</b> in total (~1.46 GB per GPU in layer split). At 608 GB/s that is only about 2.4 ms of data reads per GPU. The rest of each token is fixed per-kernel launch cost. Tensor split makes each kernel smaller, but there is almost no data-read time left to save: halving the matrices saves ~0.5 ms per GPU. Meanwhile it doubles the launches per GPU and adds 84 GPU-to-GPU syncs per token. <b>For this model, layer split is the better choice.</b> Tensor split pays off only when per-token data reads are large enough to outweigh launch and sync costs: dense or larger models, or larger batches.
+</div>
+<div class="box">
+<ol>
+  <li><b>The main cost of tensor split is all-reduce synchronization latency.</b> Each token needs about 84 all-reduces at about 234 µs each, which is roughly 60% of decode time. Bandwidth is not the limit: each all-reduce moves only 12–28 KiB.</li>
+  <li><b>The second problem is work inflation.</b> Each tensor-split GPU is busy about as long per token as both GPUs combined in layer split (12.6 ms vs 13.6 ms). Even with free communication, tensor split would reach only about 12.6–13.0 ms/token, against 15.8 ms for layer split. 
+    <ul>
+      <li>Each GPU still runs the full set of ~830 kernels per token. Each kernel launch costs about 11 µs of fixed overhead, regardless of its size.</li>
+      <li>Per GPU per token, about 2.9 ms is reading data (kernel time) and about 9.7 ms is fixed launch overhead. Halving the matrices saves only about 0.5 ms.</li>
+      <li>The LM head (~295 MB) and the f32 MoE router (~308 MB) run in full on both GPUs.</li>
+      <li>The 84 sync points cut each GPU's work into 85 pieces. The GPU drains and restarts its pipeline between pieces.</li>
+    </ul>
+  </li>
+  <li><b>Layer split's single handoff is cheap.</b> It costs about 0.4 ms per token of real transfer and wait. Its ~2.2 ms gap to GPU time is small next to the GPU work.</li>
+  <li><b>Possible improvements for tensor split:</b>
+    <ul>
+      <li>fewer reductions per token, by fusing or batching them;</li>
+      <li>a lower-latency path(on oneccl): direct peer-to-peer GPU memory instead of staging through host memory with semaphore hand-offs;</li>
+      <li>splitting the LM head and router instead of running them on both GPUs;</li>
+    </ul>
+  </li>
+</ol>
+</div>
+
+<table>
+  <tr><th>Per GPU, one decode token</th><th>Layer split</th><th>Tensor split</th></tr>
+  <tr><td>Dispatches</td><td class="n">~415 (half the layers, estimated)</td><td class="n">830 (all layers, measured)</td></tr>
+  <tr><td>Bytes read (weights + KV)</td><td class="n">~1.46 GB</td><td class="n">1.76 GB</td></tr>
+  <tr><td>Kernel time at 608 GB/s peak</td><td class="n">~2.4 ms (35%)</td><td class="n">~2.9 ms (23%)</td></tr>
+  <tr><td>Fixed dispatch overhead (busy − kernel)</td><td class="n">~4.4 ms (65%)</td><td class="n">~9.7 ms (77%)</td></tr>
+  <tr><td><b>GPU busy (measured)</b></td><td class="n"><b>6.3–7.3 ms</b></td><td class="n"><b>12.6 ms</b></td></tr>
+  <tr><td>All-reduce sync wait (GPU idle, outside busy time)</td><td class="n">~0.4 ms handoff</td><td class="n">~18.1 ms</td></tr>
+  <tr><td>Overhead per dispatch</td><td class="n">~10.6 µs</td><td class="n">~11.7 µs</td></tr>
+  <tr><th colspan="3">End to end, two GPUs, one decode token</th></tr>
+  <tr><td>How the GPUs combine</td><td class="n">Serial: GPU0 then GPU1</td><td class="n">Parallel, gated by 84 syncs</td></tr>
+  <tr><td>Wall-time formula</td><td class="n">busy<sub>0</sub> + busy<sub>1</sub> + handoff/host</td><td class="n">max(busy<sub>0</sub>, busy<sub>1</sub>) + sync wait</td></tr>
+  <tr><td>Wall-time math</td><td class="n">6.26 + 7.32 + 2.25 = 15.83 ms</td><td class="n">12.65 + 18.08 = 30.73 ms</td></tr>
+  <tr><td>Kernel time (data reads) in wall time</td><td class="n">2 × ~2.4 = ~4.8 ms (30%)</td><td class="n">~2.9 ms (9%)</td></tr>
+  <tr><td>Dispatch overhead in wall time</td><td class="n">2 × ~4.4 = ~8.8 ms (56%)</td><td class="n">~9.7 ms (32%)</td></tr>
+  <tr><td>Communication in wall time</td><td class="n">~2.25 ms (14%)</td><td class="n">~18.1 ms (59%)</td></tr>
+  <tr><td><b>Decode throughput</b> (1000 ÷ wall ms)</td><td class="n"><b>~63 tok/s</b></td><td class="n"><b>~33 tok/s</b></td></tr>
+  <tr><td>Tensor split with free communication</td><td class="n">—</td><td class="n">12.65 ms → ~79 tok/s (measured skip: 13.0 ms, 76.7 tok/s)</td></tr>
+  <tr><td>Tensor split with free comm <i>and</i> half the dispatches</td><td class="n">—</td><td class="n">2.9 + 9.7 ÷ 2 ≈ 7.8 ms → ~129 tok/s (theoretical)</td></tr>
+</table>
+<p class="note">Layer split pays both GPUs' busy time in series, so its kernel and overhead times are doubled in wall time. Tensor split runs the GPUs in parallel, but each one pays the full dispatch overhead, plus ~18 ms of sync wait. Removing communication alone gives ~1.2× over layer split (15.8 → 12.7–13.0 ms). Larger gains also need fewer dispatches per GPU.</p>
+<p class="note">How the split was estimated: bytes come from kernel shapes and quantization bit widths. Kernel time is bytes ÷ the 608 GB/s peak, so it is a lower bound. Overhead is the rest of the measured busy time.</p>
+
+<h2>2. Details</h2>
+
+<h3>Setup</h3>
+<ul>
+  <li><b>System:</b> <a href="https://gtax-ril-fm.intel.com/#/clients/18529">FM-RIL-GNR-G31-006</a>.</li>
+  <li><b>Hardware:</b> 2× Intel Arc B70 (BMG G31, 32 GiB), Linux, Mesa 26.2.4 (Xe kernel driver).</li>
+  <li><b>Model:</b> <code>MAI-Code-1.1-Flash-Q2-XS.gguf</code> (52.44 GiB), 42 layers, fully offloaded (<code>-ngl 999</code>).</li>
+  <li><b>Build:</b> llama.cpp Vulkan (<code>build-vk-sdk/bin/llama-server</code>). Profiling code: <a href="https://github.com/Kotomi-Du/llama.cpp/tree/profiling">Kotomi-Du/llama.cpp, branch <code>profiling</code></a> (commit <a href="https://github.com/Kotomi-Du/llama.cpp/commit/35a92dd72b52fa36d8b00cb8aff07fdc8549c1e5"><code>35a92dd</code></a>).</li>
+  <li><b>Server flags:</b> <code>-c 131072 -fa on -np 1 --no-host --fit off -ctk f16 -ctv f16 -b 2048 -ub 1024 --ctx-checkpoints 0 --no-cache-prompt --spec-type none</code>, with <code>-sm layer</code> or <code>-sm tensor</code>.</li>
+  <li><b>DFlash:</b> off. <code>-fa on</code> is flash attention, not DFlash.</li>
+  <li><b>Request:</b> deterministic 8,192-token synthetic prompt, 64 output tokens, <code>temperature=0</code>, <code>ignore_eos=true</code>.</li>
+</ul>
+
+<h3>Headline numbers</h3>
+<table>
+  <tr><th>Mode</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>Decode ms/token</th></tr>
+  <tr><td>Layer split</td><td class="n">1673</td><td class="n">64.6</td><td class="n">15.5</td></tr>
+  <tr><td>Tensor split</td><td class="n">1152</td><td class="n">30.6</td><td class="n">32.7</td></tr>
+  <tr><td>Tensor split, all-reduce skipped (wrong output, profiling only)</td><td class="n">1773</td><td class="n">76.7</td><td class="n">13.0</td></tr>
+</table>
+
+<h3>How each mode moves data between GPUs</h3>
+<ul>
+  <li><b>Layer split:</b> each GPU holds whole layers. Per decode token there is one handoff: GPU0 sends its 14 KiB output activation to GPU1.</li>
+  <li><b>Tensor split:</b> each layer's weight matrices are divided between the GPUs. Each GPU computes a partial result, and an <b>all-reduce</b> sums the partials so both GPUs hold the full result before the next step. This happens <b>84 times per token</b> (42 layers × 2: after attention and after the MoE block), carrying 12–28 KiB each time.</li>
+</ul>
+
+<h4>Why each GPU's work is cut into 85 pieces</h4>
+<p>After each all-reduce, the next kernel needs the summed result from both GPUs. So each GPU must submit the kernels recorded so far and signal a semaphore (a GPU sync flag). It then waits for the peer before starting the next group. 84 cut points give 85 pieces per GPU per token, which matches the 10,722 decode pieces ÷ (63 tokens × 2 GPUs) ≈ 85.1 measured.</p>
+<div class="mermaid">
+flowchart LR
+    S1["Piece 1<br/>embed + norm<br/>L0 attention (half heads)"] --> AR1(("AR 1"))
+    AR1 --> S2["Piece 2<br/>norm<br/>L0 MoE (half experts)"] --> AR2(("AR 2"))
+    AR2 --> S3["Piece 3<br/>norm<br/>L1 attention"] --> AR3(("AR 3"))
+    AR3 --> D["... 2 per layer x 42 layers ..."] --> AR84(("AR 84"))
+    AR84 --> S85["Piece 85<br/>final norm<br/>LM head (full vocab)"]
+</div>
+
+<h4>One all-reduce round trip</h4>
+<div class="mermaid">
+sequenceDiagram
+    participant G0 as GPU0
+    participant H as Host thread
+    participant G1 as GPU1
+    G0->>G0: compute piece k (~150 µs)
+    G1->>G1: compute piece k (~150 µs)
+    G0->>H: copy partial to host memory, signal semaphore
+    G1->>H: copy partial to host memory, signal semaphore
+    H->>H: exchange sync-fd semaphores
+    H-->>G0: peer ready
+    H-->>G1: peer ready
+    G0->>G0: read peer slot, add
+    G1->>G1: read peer slot, add
+    Note over G0,G1: ~234 µs of sync, both GPUs idle
+    G0->>G0: compute piece k+1
+    G1->>G1: compute piece k+1
+</div>
+
+<h4>One-token timeline, both modes (illustrative, µs)</h4>
+<div class="mermaid">
+gantt
+    title One decode token
+    dateFormat X
+    axisFormat %s
+    section Layer split GPU0
+    L0-L20 one piece      :a1, 0, 6300
+    section Layer split GPU1
+    handoff               :crit, a2, 6300, 6700
+    L21-L41 + LM head     :a3, 6700, 14000
+    section Tensor split GPU0
+    P1                    :b1, 0, 150
+    AR1                   :crit, b2, 150, 384
+    P2                    :b3, 384, 534
+    AR2                   :crit, b4, 534, 768
+    P3 ... P85 (x83 more) :b5, 768, 30700
+    section Tensor split GPU1
+    P1                    :c1, 0, 150
+    AR1                   :crit, c2, 150, 384
+    P2                    :c3, 384, 534
+    AR2                   :crit, c4, 534, 768
+    P3 ... P85 (x83 more) :c5, 768, 30700
+</div>
+<p>Layer split runs each GPU's half as one long piece with one ~0.4 ms handoff. Tensor split alternates compute and sync 85 times: about 12.6 ms of compute plus 18 ms of sync per GPU, 30.7 ms wall time. Each piece still contains the full set of norm, matrix-vector, top-k and add kernels for its block, so each GPU runs ~830 kernels per token instead of ~415.</p>
+
+<h3>Method 1: scheduler handoff timing (layer split)</h3>
+<p>Gated by <code>GGML_SCHED_PROFILE=1</code> in <code>ggml-backend.cpp</code>. Host timers wrap each GPU-to-GPU input copy. 63 decode graphs were measured, excluding 2 warm-up and 8 prompt graphs.</p>
+<table>
+  <tr><th>Layer-split decode (63 handoffs, 14,336 B each)</th><th>Total</th><th>Per handoff</th></tr>
+  <tr><td>Whole handoff call</td><td class="n">338.6 ms</td><td class="n">5.37 ms</td></tr>
+  <tr><td>Source GPU wait</td><td class="n">312.7 ms</td><td class="n">4.96 ms</td></tr>
+  <tr><td>Destination wait + transfer path</td><td class="n">25.8 ms</td><td class="n">0.41 ms</td></tr>
+</table>
+<p>The source wait mostly overlaps useful GPU0 compute. The real handoff cost is about <b>2.6% of decode time</b>.</p>
+
+<h3>Method 2: all-reduce submission timing (tensor split)</h3>
+<p>Gated by <code>GGML_VK_COMM_PROFILE=1</code> around <code>ggml_backend_vk_comm_allreduce_tensor</code> (<code>sync_fd</code> mode).</p>
+<table>
+  <tr><th>Tensor-split decode</th><th>Value</th></tr>
+  <tr><td>All-reduces</td><td class="n">5,292 (84 per graph × 63 graphs)</td></tr>
+  <tr><td>Host submission time</td><td class="n">178.6 ms total, 2.83 ms/token, 33.7 µs/call</td></tr>
+  <tr><td>Share of decode wall time</td><td class="n">8.7%</td></tr>
+</table>
+<p class="note">This covers host-side submission only. The GPU-side semaphore waits are not visible to this timer.</p>
+
+<h3>Method 3: counterfactual, all-reduce skipped (tensor split)</h3>
+<p><code>GGML_VK_COMM_SKIP=1</code> makes the all-reduce return immediately. The output is wrong, but the kernel work is unchanged. Decode improved from 32.7 to <b>13.0 ms/token</b>. So the all-reduces cost about <b>19.7 ms per token (~60%)</b>, or about <b>234 µs each</b>. That is per-operation sync latency, not bandwidth.</p>
+
+<h3>Method 4: GPU busy time per token</h3>
+<p>Source: Intel Xe DRM counters in <code>/proc/&lt;pid&gt;/fdinfo</code>. The same prompt was sent with 1 and with 129 output tokens; the difference isolates 128 decode tokens.</p>
+<table>
+  <tr><th>Mode</th><th>Wall ms/token</th><th>GPU0 busy</th><th>GPU1 busy</th><th>Total busy</th></tr>
+  <tr><td>Layer split</td><td class="n">15.83</td><td class="n">6.26</td><td class="n">7.32</td><td class="n">13.58</td></tr>
+  <tr><td>Tensor split</td><td class="n">30.73</td><td class="n">12.53</td><td class="n">12.77</td><td class="n">25.30</td></tr>
+</table>
+<p class="note">Caveat: the busy counter is assumed to exclude time spent blocked on a peer semaphore. This is not confirmed from the driver.</p>
+
+<h3>Method 5: why tensor split inflates per-GPU work</h3>
+<p>Source: decode blocks of the <code>GGML_VK_PERF_LOGGER</code> run in <code>perf-op-tensor/</code>. The logger serializes kernels, so only counts, shapes and ratios are used.</p>
+<ul>
+  <li><b>Same kernel count per GPU:</b> 830 dispatches per GPU per token (see the table in section 1).</li>
+  <li><b>Split kernels barely get cheaper:</b> q2_K mat-vec at <code>k=3584</code> takes 38 / 55 / 71 µs for <code>m</code> = 512 / 1792 / 3072. That fits ~31 µs fixed + ~0.013 µs per row.</li>
+  <li><b>Replicated work (~28% of per-GPU logger time):</b> hidden-size RMS norms, the 512-expert MoE router + top-k, the full LM head (<code>q6_K m=100544</code>), <code>MULTI_ADD</code>/<code>GET_ROWS</code>/sampling ops.</li>
+  <li><b>Fragmentation:</b> 85 pieces per GPU per token, each ending in a submit plus a semaphore wait.</li>
+</ul>
+
+<h3>Tooling notes</h3>
+<ul>
+  <li><code>GGML_VK_PERF_LOGGER=1</code> serializes every kernel (tensor decode fell to 3.1 tok/s). In layer mode it aborts at <code>ggml-vulkan.cpp:14598</code>.</li>
+  <li>A system HTTP proxy intercepts localhost requests, so benchmark clients must bypass it.</li>
+  <li>The profiling patches are on the <a href="https://github.com/Kotomi-Du/llama.cpp/tree/profiling"><code>profiling</code> branch</a>. <code>GGML_VK_COMM_SKIP</code> produces wrong output and is for profiling only.</li>
+</ul>
+
+</body>
+</html>

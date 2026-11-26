@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Windows ML llama.cpp: Vulkan backend build, run, and gaps</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; max-width: 960px; margin: 2em auto; line-height: 1.5; color: #222; }
+  h1, h2 { border-bottom: 1px solid #ddd; padding-bottom: .2em; }
+  pre { background: #f4f4f4; padding: .8em; overflow-x: auto; border-radius: 4px; }
+  code { background: #f4f4f4; padding: 0 .25em; border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #ccc; padding: .4em .6em; text-align: left; vertical-align: top; }
+  th { background: #eee; }
+  .note { background: #fff8e1; border-left: 4px solid #f0b400; padding: .5em .8em; }
+</style>
+</head>
+<body>
+
+<h1>Windows ML llama.cpp: Vulkan backend build, run, and gaps</h1>
+<p>Environment: Windows x64, Python env <code>C:\Users\yarudu\Documents\pyenv\py311</code>,
+<code>windowsml</code> 2.9.36a0 + <code>windowsml-llama-core</code> 2.9.36a0, repo <code>WindowsML</code>.
+GPUs: Intel Arc B580 and Intel UHD 770.</p>
+
+<div class="note">
+<h2 style="margin-top:0">Key finding: the slowdown is in the Windows ML Runtime API path, not in Windows ML's llama.cpp build</h2>
+<p>Same model (<code>qwen2.5-0.5b-instruct-q4_k_m.gguf</code>), same llama.cpp commit (<code>9145ddb9</code>), same machine.
+Both Windows ML apps use the prompt <i>Explain in one sentence why the sky appears blue.</i>, <code>--max-tokens 64</code>, greedy, 3 runs each.</p>
+<table>
+<tr><th>Device</th>
+    <th>Python app<br>(Windows ML Runtime API,<br><code>hello-language-model</code>)</th>
+    <th>C++ app<br>(llama.cpp API on Windows ML DLLs,<br><code>llama-upstream-api</code>)</th>
+    <th>Native llama.cpp<br>(<code>llama-bench</code> tg16)</th></tr>
+<tr><td>CPU</td><td>62.52 tok/s, first 0.208 s</td><td>80.23 tok/s, first 0.091 s</td><td>109.14 tok/s</td></tr>
+<tr><td>Arc B580</td><td><b>15.34 tok/s</b>, first 1.722 s</td><td><b>346.5 tok/s</b>, first 0.025 s (warm)<br>131.55 tok/s, first 1.270 s (first, cold run)</td><td>448.35 tok/s</td></tr>
+<tr><td>UHD 770</td><td>6.68 tok/s, first 3.677 s</td><td>47.56 tok/s, first 0.112 s (warm)<br>35.64 tok/s, first 2.228 s (first, cold run)</td><td>50.98 tok/s</td></tr>
+</table>
+<ul>
+  <li><b>C++ app vs Python app:</b> on the same Windows ML llama.cpp DLLs and Vulkan backend, the C++ app is <b>23× faster on the B580</b>, 7× on the UHD 770 and 1.3× on CPU.</li>
+  <li><b>C++ app vs native:</b> the C++ app reaches 77% of native llama-bench on the B580, 93% on the UHD 770 and 74% on CPU.
+      Windows ML's llama.cpp build is therefore close to native; the gap comes from the path an app takes.</li>
+  <li><b>Not a cold start:</b> the Python app stays slow on GPU in every run (1.7 s to the first token each time), while the C++ app is only slow on its first, cold run.
+      The cost is in the Windows ML Runtime API path the Python app uses: the decoder pipeline stage, plus copying the logits to a CPU tensor, argmax and detokenizing in Python for each token.
+      That overhead grows on GPU, where every step also waits for a GPU-to-CPU copy.</li>
+  <li><b>Recommendation:</b> for GGUF on a dGPU, call llama.cpp's API directly through Windows ML's DLLs (<code>llama-upstream-api</code>), or investigate the per-token overhead of the Runtime API's llama stage.</li>
+  <li>Windows ML's Runtime API also exposes fewer tuning options (no <code>-ngl</code>, tensor overrides or flash attention; see <a href="#section-4">section 4</a>). The C++ route can set them.</li>
+</ul>
+</div>
+
+<h2>1. How the stack fits together</h2>
+<pre>
+python main.py --backend llama
+  -> windowsml.runtime (ctypes)
+     -> windowsml\lib\WinMLRuntimeCore.dll        (Runtime C/COM API)
+        -> WinMLRuntimeLlama.dll                 (Windows ML adapter, closed source)
+           -> WinMLllama.dll -> WinMLggml.dll -> WinMLggml-base.dll   (renamed llama.cpp core)
+              -> LlamaBackends\cpu\ggml-cpu.dll        (shipped)
+              -> LlamaBackends\vulkan\ggml-vulkan.dll  (built by us)
+</pre>
+<ul>
+  <li>Every DLL is loaded by full path from <code>site-packages\windowsml\lib</code>, and <code>os.add_dll_directory</code> covers their dependencies. Nothing comes from <code>PATH</code>.</li>
+  <li>When the package loads, <code>_llama.py</code> checks size and SHA-256 against <code>WinMLLlamaPythonPairing.json</code>.</li>
+  <li>The core DLLs (<code>WinMLRuntimeLlama</code>, <code>WinMLllama</code>, <code>WinMLggml*</code>) are prebuilt by Microsoft and can't be rebuilt. Only <code>ggml-&lt;family&gt;.dll</code> backends can be built.</li>
+  <li>Default model: <code>Samples\Runtime\models\gguf\qwen2.5-0.5b-instruct-q4_k_m.gguf</code>.</li>
+  <li>Installed core: llama.cpp build 11847, commit <code>9145ddb9556c1cfa568f3189eb7be44317826e31</code>, backend API 3, ABI 7, <code>hybrid-crt</code>.</li>
+</ul>
+
+<h2>2. Build the Vulkan backend</h2>
+<h3>Prerequisites</h3>
+<ul>
+  <li>Visual Studio 2022 with the v143 x64 tools, plus Git and CMake.</li>
+  <li>Vulkan SDK (here <code>C:\VulkanSDK\1.4.363.1</code>, with <code>glslc</code>).</li>
+  <li><code>LongPathsEnabled=1</code>.</li>
+  <li>PowerShell 7. <code>winget</code> wasn't available and <code>dotnet tool install PowerShell</code> failed on SDK 8.0.400, so I installed the portable zip from GitHub releases into <code>%LOCALAPPDATA%\pwsh7</code>.</li>
+  <li>A <code>Microsoft.Windows.AI.MachineLearning.LibLlama.Core</code> <code>.nupkg</code>. No 2.9.36 version is on nuget.org.
+      I used <code>0.7.0.113-experimental</code>. It has the same llama.cpp commit, backend API and ABI as the installed core, but different DLL hashes.
+      <ul>
+        <li><a href="https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning.LibLlama.Core/0.7.0.113-experimental">Microsoft.Windows.AI.MachineLearning.LibLlama.Core 0.7.0.113-experimental</a>, the package used for the build</li>
+        <li><a href="https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.9.36-experimental">Microsoft.Windows.AI.MachineLearning 2.9.36-experimental</a>, the main package (it has no llama.cpp DLLs, so it can't be used as <code>-CorePackage</code>)</li>
+      </ul></li>
+</ul>
+
+<h3>Steps</h3>
+<ol>
+<li>Download the Core package into <code>Samples\Runtime\localpackages</code>:
+<pre>$id='microsoft.windows.ai.machinelearning.libllama.core'; $v='0.7.0.113-experimental'
+Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$id/$v/$id.$v.nupkg" -OutFile ".\Samples\Runtime\localpackages\$id.$v.nupkg"</pre></li>
+
+<li>The script won't build into py311 because py311's core DLLs don't match the package's. Instead, extract the package's own x64 payload into a scratch output folder:
+<pre>Add-Type -A System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::ExtractToDirectory($pkg, "$env:TEMP\libllama-core-0.7.0.113")
+Copy-Item "$env:TEMP\libllama-core-0.7.0.113\runtimes\win-x64\native" "$env:TEMP\vk-out" -Recurse</pre></li>
+
+<li>Run the build script under pwsh 7 inside a VS 2022 x64 dev shell. Use a <b>short</b> <code>-WorkRoot</code>:
+<pre>$vs='C:\Program Files\Microsoft Visual Studio\2022\Professional'
+Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+
+.\Tools\llama\Build-LlamaBackend.ps1 `
+  -Backend vulkan `
+  -WorkRoot C:\wl `
+  -CMakeOption "-DVulkan_ROOT=$env:VULKAN_SDK" `
+  -CorePackage $pkg `
+  -ExpectedPackageSha256 (Get-FileHash $pkg).Hash `
+  -OutputRoot "$env:TEMP\vk-out"</pre>
+<p class="note">With the default work root (<code>%TEMP%\winml-llama-backend-interop\...</code>), the nested <code>vulkan-shaders-gen</code>
+build failed with <code>No CMAKE_C_COMPILER could be found</code> (MSB8066). Changing it to <code>-WorkRoot C:\wl</code> fixed the build.
+The script deletes its build folder when it fails, so write its output to a log file to see the error.</p></li>
+
+<li>Output: <code>$env:TEMP\vk-out\LlamaBackends\vulkan\ggml-vulkan.dll</code> plus <code>WinMLLlamaBackendManifest.json</code>
+(family vulkan, build 11847, commit 9145ddb9, API 3, hybrid-crt).</li>
+
+<li>Install into py311:
+<pre>Copy-Item "$env:TEMP\vk-out\LlamaBackends\vulkan" `
+  C:\Users\yarudu\Documents\pyenv\py311\Lib\site-packages\windowsml\lib\LlamaBackends -Recurse -Force</pre>
+py311's core accepted it even though its DLL hashes differ from the 0.7.0.113 package.</li>
+</ol>
+
+<h2>3. Run the model</h2>
+<pre>cd Samples\Runtime
+python .\language\hello-language-model\main.py --backend llama --device cpu
+python .\language\hello-language-model\main.py --backend llama --device gpu            # Vulkan, default device 0 (Arc B580)
+
+$env:GGML_VK_VISIBLE_DEVICES = '1'                                                     # only the UHD 770
+python .\language\hello-language-model\main.py --backend llama --device gpu
+Remove-Item Env:GGML_VK_VISIBLE_DEVICES</pre>
+
+<h3>Performance: Windows ML sample vs native llama.cpp</h3>
+<p>Model: <code>qwen2.5-0.5b-instruct-q4_k_m.gguf</code> (462.96 MiB, 630 M params, Q4_K_M).
+Windows ML: <code>hello-language-model\main.py --max-tokens 32</code>, default prompt, greedy; it generated 16 tokens and stopped at EOS.
+Native: <code>C:\Users\yarudu\Documents\project\llama.cpp\build-winml\bin\RelWithDebInfo\llama-bench.exe</code> (branch <code>winml_exp</code>, commit <code>9145ddb9</code>, the same commit as the Windows ML core),
+<code>-p 32 -n 16 -r 5</code>, default threads.</p>
+<pre>llama-bench -m qwen2.5-0.5b-instruct-q4_k_m.gguf -p 32 -n 16 -r 5 -ngl 0  -dev none      # CPU
+llama-bench -m qwen2.5-0.5b-instruct-q4_k_m.gguf -p 32 -n 16 -r 5 -ngl 99 -dev Vulkan0   # Arc B580
+llama-bench -m qwen2.5-0.5b-instruct-q4_k_m.gguf -p 32 -n 16 -r 5 -ngl 99 -dev Vulkan1   # UHD 770</pre>
+
+<table>
+<tr><th rowspan="2">Device</th><th colspan="2">Windows ML (hello-language-model)</th><th colspan="2">Native llama-bench</th><th rowspan="2">Native / Windows ML generation</th></tr>
+<tr><th>First token</th><th>Generation tok/s</th><th>Prompt (pp32) tok/s</th><th>Generation (tg16) tok/s</th></tr>
+<tr><td>CPU</td><td>0.206 s</td><td>40.60</td><td>766.75 ± 85.66</td><td>109.14 ± 2.15</td><td>2.7×</td></tr>
+<tr><td>Arc B580 (Vulkan0)</td><td>1.69 s</td><td>7.75</td><td>2645.96 ± 8.25</td><td>448.35 ± 2.20</td><td>58×</td></tr>
+<tr><td>UHD 770 (Vulkan1)</td><td>2.95 s</td><td>4.01</td><td>349.57 ± 2.85</td><td>50.98 ± 0.32</td><td>13×</td></tr>
+</table>
+<div class="note">The two columns are measured differently, so they aren't directly comparable:
+<ul>
+  <li><b>What is timed:</b> llama-bench times only llama.cpp work, after a warm-up and averaged over 5 runs.
+      The sample is a single run that also includes Python: each step copies the logits back to CPU, takes the argmax in Python, decodes the token and prints it.</li>
+  <li><b>First run on GPU:</b> the sample's first GPU run also includes compiling the Vulkan shaders and uploading the weights.
+      That explains much of the GPU first-token time and why the B580 was slower than CPU in the sample.</li>
+  <li><b>Build:</b> both sides use llama.cpp commit <code>9145ddb9</code> (build 11847). Windows ML's core is Microsoft's prebuilt hybrid-CRT build; the native one is a local RelWithDebInfo build.</li>
+  <li><b>Sample size:</b> 16 generated tokens is too few for a stable number.</li>
+</ul>
+For a fairer comparison, run the Windows ML side for more tokens (for example <code>--max-tokens 256</code> with a longer prompt, repeated), or time it through the Tasks API.</div>
+
+<h3>Native llama.cpp at the Windows ML commit (9145ddb9)</h3>
+<p>The native numbers above come from llama.cpp built at the same commit as the Windows ML core,
+on branch <code>winml_exp</code> in a separate build folder (the existing <code>build</code> for <code>win_bug</code> is untouched):</p>
+<pre>cd C:\Users\yarudu\Documents\project\llama.cpp
+git checkout -b winml_exp 9145ddb9
+# in a VS 2022 x64 dev shell
+cmake -S . -B build-winml -G "Visual Studio 17 2022" -A x64 -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
+cmake --build build-winml --config RelWithDebInfo --target llama-bench llama-server --parallel</pre>
+
+<h4>llama-server (Arc B580)</h4>
+<pre>llama-server -m qwen2.5-0.5b-instruct-q4_k_m.gguf -ngl 99 -dev Vulkan0 --host 127.0.0.1 --port 8089 -c 4096
+# POST /v1/chat/completions  {"messages":[{"role":"user","content":"Reply with one short greeting."}],"max_tokens":32,"temperature":0}</pre>
+<table>
+<tr><th>Request</th><th>Reply</th><th>Prompt</th><th>Generation</th><th>Time to first token</th></tr>
+<tr><td>1 (cold)</td><td rowspan="3">Hello! It's nice to meet you. How can I assist you today?</td><td>35 tok @ 59.1 t/s</td><td>17 tok @ 43.1 t/s</td><td>0.592 s</td></tr>
+<tr><td>2 (warm, prompt cached)</td><td>1 tok @ 340.7 t/s</td><td>17 tok @ 406.8 t/s</td><td>0.003 s</td></tr>
+<tr><td>3 (warm, prompt cached)</td><td>1 tok @ 322.4 t/s</td><td>17 tok @ 387.6 t/s</td><td>0.003 s</td></tr>
+</table>
+<ul>
+  <li>The reply is identical to the Windows ML sample's (greedy).</li>
+  <li>The server's cold first request (43 tok/s) is slow for the same reason the sample is: the first GPU work compiles Vulkan pipelines.
+      Warm requests are about 400 tok/s, close to llama-bench's 450.</li>
+  <li>The Windows ML sample loads a new process for every run, so it always measures a cold start. That explains most of the gap on GPU.</li>
+</ul>
+<ul>
+  <li>Windows PowerShell 5.1 sets exit code 1 because ggml prints its device list on stderr. Generation itself finishes normally.</li>
+  <li>Vulkan device numbers follow driver order, so check the <code>ggml_vulkan: N = ...</code> lines.</li>
+  <li>Rebuild the backend after any <code>windowsml</code> upgrade. <code>pip uninstall</code> doesn't remove <code>LlamaBackends\vulkan</code>.</li>
+</ul>
+
+<h2 id="section-4">4. What Windows ML llama.cpp is missing compared with native llama.cpp</h2>
+<p>Windows ML wraps llama.cpp as one pipeline stage. Its only tuning options (<code>IWinMLLlamaStageOptions</code>, Python <code>stage.llama_options()</code>) are:
+<code>thread_count</code> (<code>-t</code>), <code>batch_thread_count</code> (<code>-tb</code>), <code>micro_batch_size</code> (<code>-ub</code>), plus context capacity (<code>-c</code>).</p>
+
+<table>
+<tr><th>Native llama.cpp</th><th>Windows ML llama.cpp</th></tr>
+<tr><td><code>-ngl N</code> partial GPU offload</td><td>Missing. The whole model runs on one target (CPU or GPU).</td></tr>
+<tr><td><code>--cpu-moe</code>, <code>--n-cpu-moe</code>, <code>-ot</code> / tensor buffer overrides (e.g. MoE experts on CPU)</td><td>Missing.</td></tr>
+<tr><td><code>-sm</code>, <code>-ts</code>, <code>-mg</code> multi-GPU split and main GPU selection</td><td>Missing from the Windows ML Runtime API. A GPU can only be picked with the ggml env var <code>GGML_VK_VISIBLE_DEVICES</code>.
+<b>Possible through the llama.cpp API</b> (<code>llama-upstream-api</code> sample, see below): <code>layer</code> works, <code>row</code> isn't supported by Vulkan.</td></tr>
+<tr><td><code>--device</code> list of devices</td><td>Only CPU, GPU or NPU (NPU is rejected for GGUF).</td></tr>
+<tr><td>Sampling (<code>--temp</code>, <code>--top-k</code>, <code>--top-p</code>, <code>--min-p</code>, penalties, grammar)</td><td>Not in the sample, which uses greedy argmax over logits. The Tasks API has its own text-generation config.</td></tr>
+<tr><td><code>-fa</code> flash attention, <code>-ctk/-ctv</code> KV-cache types, <code>--no-kv-offload</code></td><td>Not exposed.</td></tr>
+<tr><td><code>--mlock</code>, <code>--no-mmap</code>, <code>--numa</code></td><td>Not exposed.</td></tr>
+<tr><td>RoPE / YaRN scaling overrides, <code>--override-kv</code></td><td>Not exposed.</td></tr>
+<tr><td>LoRA adapters (<code>--lora</code>), control vectors</td><td>Not exposed.</td></tr>
+<tr><td>Tools: <code>llama-server</code> (OpenAI API), <code>llama-bench</code>, <code>llama-quantize</code>, <code>llama-perplexity</code></td><td>Not shipped. Only the runtime DLLs are.</td></tr>
+<tr><td>Any backend: CUDA, Vulkan, SYCL, OpenCL, HIP, Metal…</td><td>The CPU backend ships. CUDA comes as an opt-in package. Others, like Vulkan, have to be built with <code>Build-LlamaBackend.ps1</code>.</td></tr>
+<tr><td>Rebuild the core or pick any llama.cpp commit</td><td>Not possible. The core DLLs are prebuilt, renamed (<code>WinML*</code>), hash-pinned and tied to <code>WinMLRuntimeCore.dll</code>.</td></tr>
+<tr><td>Speculative decoding with a draft model</td><td>Supported (<code>SetDraftPredictorPath</code> / Tasks speculative options).</td></tr>
+</table>
+
+<h3>Ways to get the missing features</h3>
+<ul>
+  <li><b>Call the llama.cpp API through Windows ML's DLLs:</b> <code>Samples\Runtime\interop\llama-upstream-api</code> links <code>WinMLllama.lib</code>/<code>WinMLggml.lib</code>.
+      From C++ you can then set <code>llama_model_params.n_gpu_layers</code> and <code>tensor_buft_overrides</code> (for example <code>\.ffn_(up|down|gate)_exps</code> to CPU, which is what <code>--cpu-moe</code> does).</li>
+  <li><b>Use native llama.cpp:</b> build or download <code>llama-cli</code>/<code>llama-server</code> with Vulkan and use every flag, for example
+      <code>llama-cli -m model.gguf -ngl 999 --cpu-moe -t 8</code>. This bypasses Windows ML.</li>
+</ul>
+
+<h2>5. Experiment: MoE model and multi-GPU split</h2>
+<p>Code change: branch <a href="https://github.com/Kotomi-Du/WindowsML/tree/winml_exp"><code>winml_exp</code></a> on
+<code>https://github.com/Kotomi-Du/WindowsML</code>, commit
+<a href="https://github.com/Kotomi-Du/WindowsML/commit/1e04cc1"><code>1e04cc1</code></a>
+("llama-upstream-api: add --split-mode, --tensor-split and --main-gpu options"), changing
+<a href="https://github.com/Kotomi-Du/WindowsML/blob/winml_exp/Samples/Runtime/interop/llama-upstream-api/main.cpp"><code>Samples/Runtime/interop/llama-upstream-api/main.cpp</code></a>.</p>
+<p>Model: <a href="https://huggingface.co/lmstudio-community/granite-3.1-1b-a400m-instruct-GGUF">IBM Granite 3.1 1B-A400M</a>
+(<code>granite-3.1-1b-a400m-instruct-Q3_K_L.gguf</code>, MoE: 1.3B total, 0.4B active, 32 experts). Prompt: <i>Reply with one short greeting.</i>, greedy.</p>
+
+<h3>Through the Windows ML Runtime (Python <code>hello-language-model</code>)</h3>
+<pre>python .\language\hello-language-model\main.py --backend llama --device cpu --model .\models\gguf\granite-3.1-1b-a400m-instruct-Q3_K_L.gguf --max-tokens 64
+python .\language\hello-language-model\main.py --backend llama --device gpu --model .\models\gguf\granite-3.1-1b-a400m-instruct-Q3_K_L.gguf --max-tokens 64</pre>
+<table>
+<tr><th>Device</th><th>Reply</th><th>Tokens</th><th>First token</th><th>Generation tok/s</th></tr>
+<tr><td>CPU</td><td>Hello! How can I assist you today?</td><td>9</td><td>0.314 s</td><td>22.75</td></tr>
+<tr><td>Arc B580</td><td>Greetings! How can I assist you today?</td><td>11</td><td>2.211 s</td><td>4.09</td></tr>
+</table>
+<ul>
+  <li>The MoE model loads and runs. Small floating-point differences between the CPU and Vulkan backends lead to different greedy replies.</li>
+  <li>The whole model runs on one target. Windows ML has no expert placement (<code>--cpu-moe</code>) and no multi-device split.</li>
+</ul>
+
+<h3>Through the llama.cpp API on Windows ML's DLLs (<code>llama-upstream-api</code>)</h3>
+<p>I extended <code>Samples\Runtime\interop\llama-upstream-api\main.cpp</code> with <code>--split-mode none|layer|row</code>, <code>--tensor-split A,B,...</code> and
+<code>--main-gpu N</code>, which set <code>llama_model_params.split_mode</code>, <code>tensor_split</code> and <code>main_gpu</code>.
+It builds against the pinned <code>LibLlama.Core 0.7.0.113-experimental</code>, with the Vulkan backend copied to <code>LlamaBackends\vulkan</code>.</p>
+<pre>cd Samples\Runtime
+.\build.ps1 -Configuration Release -PackageOnly -Sample llama-upstream-api
+Copy-Item $env:TEMP\vk-out\LlamaBackends\vulkan .\out\x64\Release\llama-upstream-api\LlamaBackends -Recurse -Force
+.\out\x64\Release\llama-upstream-api\llama-upstream-api.exe --model .\models\gguf\granite-3.1-1b-a400m-instruct-Q3_K_L.gguf `
+  --prompt "Reply with one short greeting." --max-tokens 32 --split-mode layer --tensor-split 3,1</pre>
+<p>Devices registered: CPU (i9-13900K), Vulkan0 (Arc B580), Vulkan1 (UHD 770).</p>
+<table>
+<tr><th>Options</th><th>Result</th></tr>
+<tr><td><code>--split-mode none --main-gpu 0</code></td><td>Works (B580 only): "Hello! How can I assist you today?"</td></tr>
+<tr><td><code>--split-mode layer --tensor-split 3,1</code></td><td>Works (layers about 3:1 across B580 and UHD 770): "Hello! How can I assist you today?".
+llama.cpp's default device list leaves out integrated GPUs when a discrete GPU is present, so the sample passes every GPU and iGPU in <code>llama_model_params.devices</code> when splitting.
+Without that, the "split" silently ran on the B580 alone.</td></tr>
+<tr><td><code>--split-mode row --tensor-split 3,1</code></td><td>Fails: <code>device Vulkan0 does not support split buffers</code>. Row split needs a backend with split buffers, such as CUDA.</td></tr>
+</table>
+<ul>
+  <li><b>Finding:</b> the multi-GPU layer split that the Windows ML Runtime API lacks works when an application calls llama.cpp's own API on the same Windows ML llama.cpp DLLs.
+      The same route could add <code>n_gpu_layers</code> and <code>tensor_buft_overrides</code> (MoE experts on CPU).</li>
+</ul>
+
+<h3>Multi-GPU performance through Windows ML's llama.cpp DLLs</h3>
+<p>Measured with the <code>llama-upstream-api</code> sample itself (Windows ML's <code>WinMLllama.dll</code> core with the Vulkan backend built in section 2).
+The sample now prints <code>[tokens=N, first=Xs, throughput=Y/s]</code>: <i>first</i> is the prompt decode plus the first token,
+and <i>throughput</i> covers the tokens after it. Default prompt (<i>Explain in one sentence why the sky appears blue.</i>), <code>--max-tokens 64</code>, greedy, 3 runs each (mean shown).</p>
+<pre>$o = '.\out\x64\Release\llama-upstream-api'
+$m = '.\models\gguf\granite-3.1-1b-a400m-instruct-Q3_K_L.gguf'
+$env:GGML_VK_VISIBLE_DEVICES='-1'; &amp; "$o\llama-upstream-api.exe" --model $m --max-tokens 64 --split-mode none                  # CPU only
+$env:GGML_VK_VISIBLE_DEVICES='0';  &amp; "$o\llama-upstream-api.exe" --model $m --max-tokens 64 --split-mode none                  # B580 only
+$env:GGML_VK_VISIBLE_DEVICES='1';  &amp; "$o\llama-upstream-api.exe" --model $m --max-tokens 64 --split-mode none                  # UHD 770 only
+Remove-Item Env:GGML_VK_VISIBLE_DEVICES
+&amp; "$o\llama-upstream-api.exe" --model $m --max-tokens 64 --split-mode layer --tensor-split 1,1                                    # both GPUs 1:1
+&amp; "$o\llama-upstream-api.exe" --model $m --max-tokens 64 --split-mode layer --tensor-split 3,1                                    # both GPUs 3:1</pre>
+<table>
+<tr><th>Configuration</th><th>Tokens</th><th>First token</th><th>Generation tok/s</th><th>vs B580 alone</th></tr>
+<tr><td>CPU only</td><td>41</td><td>0.135 s</td><td>113.65</td><td>0.30×</td></tr>
+<tr><td><b>Arc B580 only</b></td><td>42</td><td><b>0.031 s</b></td><td><b>378.55</b></td><td><b>1.00×</b></td></tr>
+<tr><td>UHD 770 only</td><td>50</td><td>0.490 s (3.862 s on the first, cold run)</td><td>43.36 (33.12 cold)</td><td>0.11×</td></tr>
+<tr><td>B580 + UHD 770, layer split 1:1</td><td>42</td><td>0.261 s</td><td>72.50</td><td>0.19×</td></tr>
+<tr><td>B580 + UHD 770, layer split 3:1</td><td>42</td><td>0.131 s</td><td>108.72</td><td>0.29×</td></tr>
+</table>
+<ul>
+  <li><b>Finding:</b> splitting one model across the two GPUs is <b>slower</b> than the B580 alone: 3.5× slower at 3:1 and 5.2× at 1:1, and slower than CPU only.
+      With a layer split, each token runs the UHD 770's share of layers one after another with the B580's, and its hidden state is copied between the two GPUs.
+      The UHD 770 runs about 9× slower than the B580, so its share dominates the time per token.</li>
+  <li>A multi-GPU split only pays off when the model doesn't fit on one GPU, or when the GPUs are similar in speed. This 0.7 GB model fits easily on the 12 GB B580.</li>
+  <li>Through Windows ML's own DLLs, the B580 runs at 378 tok/s, close to native llama.cpp. The low numbers from the Python <code>hello-language-model</code> sample
+      (4.09 tok/s on the B580) therefore come from that sample's Python loop and cold start, not from Windows ML's llama.cpp build.</li>
+  <li>The UHD 770's first run took 3.9 s to the first token, likely while the driver compiled and cached its Vulkan shaders. Later runs were warm.</li>
+</ul>
+
+</body>
+</html>
